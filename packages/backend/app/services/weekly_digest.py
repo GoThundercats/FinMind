@@ -26,6 +26,33 @@ from ..models import Category, Expense
 
 logger = logging.getLogger("finmind.weekly_digest")
 
+# ISO 4217 code → display symbol.  Add more as FinMind expands.
+_CURRENCY_SYMBOLS: dict[str, str] = {
+    "USD": "$",
+    "EUR": "€",
+    "GBP": "£",
+    "INR": "₹",
+    "JPY": "¥",
+    "CNY": "¥",
+    "AUD": "A$",
+    "CAD": "C$",
+    "CHF": "Fr",
+    "SGD": "S$",
+    "AED": "د.إ",
+    "MXN": "MX$",
+    "BRL": "R$",
+    "KRW": "₩",
+    "HKD": "HK$",
+    "SEK": "kr",
+    "NOK": "kr",
+    "DKK": "kr",
+}
+
+
+def _currency_symbol(code: str) -> str:
+    """Return the display symbol for *code*, falling back to the code itself."""
+    return _CURRENCY_SYMBOLS.get(code.upper(), code)
+
 
 # ---------------------------------------------------------------------------
 # Internal data structures
@@ -85,12 +112,19 @@ def _load_expenses(
     session: Session,
     window_start: date,
     window_end: date,
+    currency: str = "INR",
 ) -> list[Expense]:
-    """Fetch all expenses for a user within the given date window."""
+    """Fetch all expenses for a user within the given date window.
+
+    Filters by *currency* so that mixed-currency rows (e.g. EUR expenses
+    appearing in an INR digest) are never summed together, which would produce
+    silent, meaningless totals.
+    """
     return (
         session.query(Expense)
         .filter(
             Expense.user_id == uid,
+            Expense.currency == currency,
             Expense.spent_at >= window_start,
             Expense.spent_at <= window_end,
         )
@@ -225,7 +259,7 @@ def _generate_insights(
 ) -> list[str]:
     """Rule-based plain-English insight strings. No LLM required."""
     insights: list[str] = []
-    sym = currency
+    sym = _currency_symbol(currency)   # "INR" → "₹", "EUR" → "€", etc.
 
     # Overall spend change
     if prior.total_spend > 0:
@@ -332,8 +366,9 @@ def build_weekly_digest(
         uid, current_start, current_end, prior_start, prior_end,
     )
 
-    # Single DB query covering both windows
-    all_expenses = _load_expenses(uid, session, prior_start, current_end)
+    # Single DB query covering both windows — filtered to user's chosen currency
+    # so mixed-currency rows never corrupt aggregated totals.
+    all_expenses = _load_expenses(uid, session, prior_start, current_end, currency)
     category_map = _build_category_map(uid, session)
 
     current = _summarise_window(all_expenses, current_start, current_end, category_map)

@@ -10,6 +10,9 @@ Covers:
   - Trend directions: UP, DOWN, FLAT, NEW, GONE
   - Cache: second call is served from cache (same payload)
   - Auth: 401 without token
+  - Multi-currency filter: EUR expenses excluded from INR digest (and vice versa)
+  - Currency symbol display: insights use '₹'/'€'/'$', not raw ISO codes
+  - Zero-in-target-currency: only foreign expenses → zero totals, no crash
 """
 
 from datetime import date, timedelta
@@ -221,3 +224,154 @@ def test_weekly_digest_cached(client, auth_header):
     assert r1.status_code == 200
     assert r2.status_code == 200
     assert r1.get_json() == r2.get_json()
+
+
+# ---------------------------------------------------------------------------
+# Currency filter + symbol tests
+# Regression suite for:
+#   - _load_expenses() currency= filter (prevents silent multi-currency
+#     cross-contamination in totals)
+#   - _currency_symbol() lookup (ensures insights use '₹' not 'INR' etc.)
+# ---------------------------------------------------------------------------
+
+def _post_expense_currency(client, auth_header, amount, description,
+                           spent_at, currency, category_id=None,
+                           expense_type="EXPENSE"):
+    """Variant of _post_expense that includes the currency field."""
+    return client.post(
+        "/expenses",
+        json={
+            "amount": amount,
+            "description": description,
+            "date": spent_at,
+            "expense_type": expense_type,
+            "category_id": category_id,
+            "currency": currency,
+        },
+        headers=auth_header,
+    )
+
+
+def test_weekly_digest_multi_currency_filter_default(client, auth_header):
+    """
+    Mixed-currency expenses must NOT be summed together.
+
+    Setup: 500 INR + 200 EUR in the current window.
+    The default INR digest must return total_spend == 500.0, not 700.0.
+
+    Catches the pre-fix bug where _load_expenses() fetched all currencies
+    and _summarise_window() silently added 200 EUR into the INR total.
+    """
+    food_id = _create_category(client, auth_header, "Food")
+
+    # INR expense — must appear in the default (INR) digest
+    r = _post_expense_currency(
+        client, auth_header, 500.00, "Groceries INR",
+        _today_minus(2), "INR", food_id,
+    )
+    assert r.status_code == 201
+
+    # EUR expense — must be excluded from the INR digest entirely
+    r = _post_expense_currency(
+        client, auth_header, 200.00, "Groceries EUR",
+        _today_minus(2), "EUR", food_id,
+    )
+    assert r.status_code == 201
+
+    r = client.get("/digest/weekly", headers=auth_header)
+    assert r.status_code == 200
+    data = r.get_json()
+
+    assert data["currency"] == "INR"
+    assert data["current_week"]["total_spend"] == 500.0, (
+        f"EUR expense leaked into INR digest — total_spend should be 500.0, "
+        f"got {data['current_week']['total_spend']}"
+    )
+    # Categories should only reflect the INR expense
+    assert len(data["current_week"]["categories"]) == 1
+    assert data["current_week"]["categories"][0]["amount"] == 500.0
+
+
+def test_weekly_digest_multi_currency_filter_explicit(client, auth_header):
+    """
+    Requesting digest with ?currency=EUR must only aggregate EUR expenses.
+
+    Setup: 500 INR + 200 EUR.
+    EUR digest must return total_spend == 200.0.
+    """
+    food_id = _create_category(client, auth_header, "Food")
+
+    _post_expense_currency(
+        client, auth_header, 500.00, "Groceries INR",
+        _today_minus(2), "INR", food_id,
+    )
+    _post_expense_currency(
+        client, auth_header, 200.00, "Groceries EUR",
+        _today_minus(2), "EUR", food_id,
+    )
+
+    r = client.get("/digest/weekly?currency=EUR", headers=auth_header)
+    assert r.status_code == 200
+    data = r.get_json()
+
+    assert data["currency"] == "EUR"
+    assert data["current_week"]["total_spend"] == 200.0, (
+        f"INR expense leaked into EUR digest — total_spend should be 200.0, "
+        f"got {data['current_week']['total_spend']}"
+    )
+
+
+def test_weekly_digest_zero_in_target_currency(client, auth_header):
+    """
+    User has expenses in EUR only. Default INR digest must return zero
+    totals — not crash, not leak the EUR amounts.
+
+    Validates that the currency filter gracefully handles the case where
+    no expenses exist in the requested currency.
+    """
+    _post_expense_currency(
+        client, auth_header, 999.00, "Foreign spend",
+        _today_minus(2), "EUR",
+    )
+
+    r = client.get("/digest/weekly", headers=auth_header)
+    assert r.status_code == 200
+    data = r.get_json()
+
+    assert data["current_week"]["total_spend"] == 0.0
+    assert data["current_week"]["total_income"] == 0.0
+    assert data["current_week"]["categories"] == []
+    assert data["category_trends"] == []
+    assert isinstance(data["insights"], list)   # insights list still present
+
+
+def test_weekly_digest_currency_symbol_in_insights(client, auth_header):
+    """
+    Insights must display the Unicode symbol ('₹', '€', '$'), NOT the raw
+    ISO 4217 code ('INR', 'EUR', 'USD').
+
+    Regression guard for: sym = currency → sym = _currency_symbol(currency).
+
+    Uses INR (the default) because its symbol '₹' is unambiguously distinct
+    from the code and cannot appear by coincidence.
+    """
+    _post_expense_currency(
+        client, auth_header, 300.00, "Coffee",
+        _today_minus(2), "INR",
+    )
+
+    r = client.get("/digest/weekly", headers=auth_header)
+    assert r.status_code == 200
+    data = r.get_json()
+
+    insights_text = " ".join(data["insights"])
+
+    assert "₹" in insights_text, (
+        f"Expected rupee symbol '₹' in insights but it was absent. "
+        f"Insights: {insights_text!r}"
+    )
+    # 'INR ' (code followed by a space then a number) must not appear
+    assert "INR " not in insights_text, (
+        f"Raw ISO code 'INR' found in insights — _currency_symbol() lookup "
+        f"is not being applied. Insights: {insights_text!r}"
+    )

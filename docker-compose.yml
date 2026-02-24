@@ -76,8 +76,16 @@ services:
       - ./app:/app
       - /app/node_modules
     ports: ["5173:5173"]
-    depends_on: [backend]
+    depends_on:
+      backend:
+        condition: service_healthy
     command: sh -c "npm install && npm run dev -- --host 0.0.0.0 --port 5173"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:5173 || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 60s
     restart: unless-stopped
 
   prometheus:
@@ -146,7 +154,9 @@ services:
     image: oliver006/redis_exporter:v1.63.0
     environment:
       REDIS_ADDR: redis://redis:6379
-    depends_on: [redis]
+    depends_on:
+      redis:
+        condition: service_healthy
     restart: unless-stopped
 
   nginx-exporter:

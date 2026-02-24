@@ -49,7 +49,8 @@ def record_login(
 
     if existing:
         existing.last_seen_at = now
-        existing.ip_address = ip_address    # update in case of dynamic IP
+        if ip_address:  # guard: never overwrite a known IP with None
+            existing.ip_address = ip_address
         session.commit()
         logger.debug("Known device login user=%s device=%s", uid, existing.id)
         return {"device_id": existing.id, "is_new": False, "trusted": existing.trusted}

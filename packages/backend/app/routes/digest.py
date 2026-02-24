@@ -15,7 +15,7 @@ Cache is keyed on user ID + ISO week string so it auto-expires on rollover.
 import logging
 from datetime import date
 
-from flask import Blueprint, jsonify
+from flask import Blueprint, jsonify, request
 from flask_jwt_extended import get_jwt_identity, jwt_required
 
 from ..extensions import db
@@ -29,9 +29,9 @@ logger = logging.getLogger("finmind.digest")
 _CACHE_TTL = 600  # 10 minutes
 
 
-def _digest_cache_key(uid: int, today: date) -> str:
+def _digest_cache_key(uid: int, today: date, currency: str = "INR") -> str:
     iso = today.isocalendar()
-    return f"user:{uid}:weekly_digest:{iso.year}:W{iso.week:02d}"
+    return f"user:{uid}:weekly_digest:{iso.year}:W{iso.week:02d}:{currency}"
 
 
 @bp.get("/weekly")
@@ -85,14 +85,16 @@ def weekly_digest():
     uid = int(get_jwt_identity())
     today = date.today()
 
-    cache_key = _digest_cache_key(uid, today)
+    user = db.session.get(User, uid)
+    default_currency = user.preferred_currency if user else "INR"
+    # Allow explicit override via ?currency=EUR (falls back to user preference)
+    currency = (request.args.get("currency") or default_currency).upper()
+
+    cache_key = _digest_cache_key(uid, today, currency)
     cached = cache_get(cache_key)
     if cached:
         logger.info("Weekly digest cache hit user=%s", uid)
         return jsonify(cached)
-
-    user = db.session.get(User, uid)
-    currency = user.preferred_currency if user else "INR"
 
     digest = build_weekly_digest(
         uid=uid,
